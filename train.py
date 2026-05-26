@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -7,28 +8,36 @@ from sklearn.datasets import fetch_20newsgroups
 from sklearn.model_selection import train_test_split
 import pandas as pd
 
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# 1. Tokenizer / vocab
+
+# 1. Tokenizer / vocabulary
 
 
 def build_vocab(texts, max_size=20000, min_freq=2):
     counter = Counter()
-    for t in texts:
-        counter.update(t.lower().split())
+
+    for text in texts:
+        counter.update(text.lower().split())
+
     vocab = {"<pad>": 0, "<unk>": 1}
-    for w, c in counter.most_common(max_size):
-        if c < min_freq:
+
+    for word, count in counter.most_common(max_size):
+        if count < min_freq:
             continue
-        vocab[w] = len(vocab)
+        vocab[word] = len(vocab)
+
     return vocab
 
+
 def encode(text, vocab, max_len=200):
-    tokens = [vocab.get(w, 1) for w in text.lower().split()]
+    tokens = [vocab.get(word, 1) for word in text.lower().split()]
     tokens = tokens[:max_len]
     tokens += [0] * (max_len - len(tokens))
     return torch.tensor(tokens, dtype=torch.long)
+
 
 
 # 2. Dataset
@@ -36,7 +45,7 @@ def encode(text, vocab, max_len=200):
 
 class TextDataset(Dataset):
     def __init__(self, texts, labels, vocab, max_len=200):
-        self.X = [encode(t, vocab, max_len) for t in texts]
+        self.X = [encode(text, vocab, max_len) for text in texts]
         self.y = torch.tensor(labels, dtype=torch.long)
 
     def __len__(self):
@@ -46,7 +55,8 @@ class TextDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-# 3. Model: Conv1D + Linear + Linear
+
+# 3. Model: Embedding + Conv1D + Linear + Dropout
 
 
 class SimpleCNN(nn.Module):
@@ -66,15 +76,18 @@ class SimpleCNN(nn.Module):
 
         self.conv = nn.Sequential(*layers)
 
+        self.dropout = nn.Dropout(0.3)
+
         self.fc1 = nn.Linear(128, 64)
         self.act = activation_fn()
         self.fc2 = nn.Linear(64, num_classes)
 
     def forward(self, x):
-        x = self.embedding(x)          # (B, L, E)
-        x = x.permute(0, 2, 1)         # (B, E, L)
-        x = self.conv(x)               # (B, 128, L)
-        x = torch.max(x, dim=2).values # global max pooling
+        x = self.embedding(x)
+        x = x.permute(0, 2, 1)
+        x = self.conv(x)
+        x = torch.max(x, dim=2).values
+        x = self.dropout(x)
         x = self.act(self.fc1(x))
         x = self.fc2(x)
         return x
@@ -87,19 +100,21 @@ def compute_accuracy(model, loader):
     model.eval()
     correct = 0
     total = 0
+
     with torch.no_grad():
         for X, y in loader:
             X, y = X.to(device), y.to(device)
             preds = torch.argmax(model(X), dim=1)
             correct += (preds == y).sum().item()
             total += y.size(0)
+
     return correct / total
+
 
 
 # 5. Training
 
-
-def train_model(model, train_loader, val_loader=None, epochs=5):
+def train_model(model, train_loader, val_loader=None, epochs=15):
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()
@@ -110,6 +125,7 @@ def train_model(model, train_loader, val_loader=None, epochs=5):
 
         for X, y in train_loader:
             X, y = X.to(device), y.to(device)
+
             logits = model(X)
             loss = loss_fn(logits, y)
 
@@ -119,7 +135,7 @@ def train_model(model, train_loader, val_loader=None, epochs=5):
 
             total_loss += loss.item() * y.size(0)
 
-        msg = f"Epoch {epoch+1}, loss={total_loss/len(train_loader.dataset):.4f}"
+        msg = f"Epoch {epoch + 1}, loss={total_loss / len(train_loader.dataset):.4f}"
 
         if val_loader:
             acc = compute_accuracy(model, val_loader)
@@ -128,27 +144,34 @@ def train_model(model, train_loader, val_loader=None, epochs=5):
         print(msg)
 
 
-# 6. IMDB
+
+# 6. IMDB - tylko oryginalne dane z datasetu
 
 
 def run_imdb(num_conv_layers, activation_fn):
     print("Loading IMDB...")
+
     imdb = load_dataset("imdb")
 
-    texts = imdb["train"]["text"]
-    labels = imdb["train"]["label"]
+    texts = list(imdb["train"]["text"])
+    labels = list(imdb["train"]["label"])
 
     X_train, X_test, y_train, y_test = train_test_split(
-        texts, labels, test_size=0.2, random_state=42
+        texts,
+        labels,
+        test_size=0.2,
+        random_state=42,
+        stratify=labels
     )
 
+    # Słownik budujemy tylko na danych treningowych
     vocab = build_vocab(X_train)
 
     train_ds = TextDataset(X_train, y_train, vocab)
-    test_ds  = TextDataset(X_test,  y_test,  vocab)
+    test_ds = TextDataset(X_test, y_test, vocab)
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    test_loader  = DataLoader(test_ds,  batch_size=64)
+    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=128)
 
     model = SimpleCNN(
         vocab_size=len(vocab),
@@ -158,35 +181,41 @@ def run_imdb(num_conv_layers, activation_fn):
         activation_fn=activation_fn
     )
 
-    print("Training IMDB model...")
-    train_model(model, train_loader, val_loader=test_loader, epochs=5)
-
+    train_model(model, train_loader, val_loader=test_loader, epochs=15)
     acc = compute_accuracy(model, test_loader)
+
     print(f"IMDB Test Accuracy: {acc:.4f}")
     return acc
 
 
-# 7. 20 Newsgroups
+
+# 7. 20 Newsgroups - tylko oryginalne dane z datasetu
 
 
 def run_newsgroups(num_conv_layers, activation_fn):
     print("Loading 20 Newsgroups...")
-    data = fetch_20newsgroups(subset='train')
 
-    texts = data.data
-    labels = data.target
+    data = fetch_20newsgroups(subset="train")
+
+    texts = list(data.data)
+    labels = list(data.target)
 
     X_train, X_test, y_train, y_test = train_test_split(
-        texts, labels, test_size=0.2, random_state=42
+        texts,
+        labels,
+        test_size=0.2,
+        random_state=42,
+        stratify=labels
     )
 
+    # Słownik budujemy tylko na danych treningowych
     vocab = build_vocab(X_train)
 
     train_ds = TextDataset(X_train, y_train, vocab)
-    test_ds  = TextDataset(X_test,  y_test,  vocab)
+    test_ds = TextDataset(X_test, y_test, vocab)
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    test_loader  = DataLoader(test_ds,  batch_size=64)
+    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=128)
 
     model = SimpleCNN(
         vocab_size=len(vocab),
@@ -196,12 +225,12 @@ def run_newsgroups(num_conv_layers, activation_fn):
         activation_fn=activation_fn
     )
 
-    print("Training 20 Newsgroups model...")
-    train_model(model, train_loader, val_loader=test_loader, epochs=5)
-
+    train_model(model, train_loader, val_loader=test_loader, epochs=15)
     acc = compute_accuracy(model, test_loader)
+
     print(f"20 Newsgroups Test Accuracy: {acc:.4f}")
     return acc
+
 
 
 # 8. Main Experiment
@@ -241,6 +270,7 @@ def experiment():
     df = pd.DataFrame(results)
     print("\nFINAL RESULTS:")
     print(df)
+
 
 
 # 9. MAIN
